@@ -12,16 +12,34 @@
 #include "imports/discovery-params.fc";
 #pragma version >=0.2.0;
 
+;; Global Variables for Timelock and Multisig
+global int mint_timing;
+global slice proposed_mint_address;
+global int proposed_mint_amount;
+
+global slice multisig_address;  ;; The multisig wallet address
+
+global slice proposed_admin;
+global int change_admin_timing;
+
+global cell proposed_content;
+global int change_content_timing;
+
+const int timelock_duration = 48 * 60 * 60;  ;; 48 hours
+
 (int, slice, cell, cell) load_data() inline {
     slice ds = get_data().begin_parse();
-    return (
-            ds~load_coins(), ;; total_supply
-            ds~load_msg_addr(), ;; admin_address
-            ds~load_ref(), ;; content
-            ds~load_ref() ;; jetton_wallet_code
-    );
+
+    int total_supply = ds~load_coins();
+    slice admin_address = ds~load_msg_addr();
+    cell content = ds~load_ref();
+    cell jetton_wallet_code = ds~load_ref();
+    ds.end_parse(); 
+
+    return (total_supply, admin_address, content, jetton_wallet_code);
 }
 
+;; Function to save contract data (total supply, admin, content, and jetton wallet code)
 () save_data(int total_supply, slice admin_address, cell content, cell jetton_wallet_code) impure inline {
     set_data(begin_cell()
             .store_coins(total_supply)
@@ -29,9 +47,28 @@
             .store_ref(content)
             .store_ref(jetton_wallet_code)
             .end_cell()
-    );
+    ).end_parse();
 }
 
+;; Function to propose minting tokens (called by multisig)
+() propose_mint_tokens(slice to_address, int amount) impure {
+    (int total_supply, slice admin_address, cell content, cell jetton_wallet_code) = load_data();
+    throw_unless(73, equal_slices(sender_address, multisig_address));  ;; Only the multisig wallet can propose
+    mint_timing = now() + timelock_duration;  ;; Set a 48-hour timelock
+    proposed_mint_address = to_address;
+    proposed_mint_amount = amount;
+}
+
+;; Function to execute minting after the timelock expires
+() execute_mint_tokens() impure {
+    throw_unless(74, now() >= mint_timing);  ;; Ensure the timelock period has passed
+    (int total_supply, slice admin_address, cell content, cell jetton_wallet_code) = load_data();
+    cell master_msg = null();  ;; This can be customized based on your logic
+    mint_tokens(proposed_mint_address, jetton_wallet_code, proposed_mint_amount, master_msg);  ;; Mint tokens
+    save_data(total_supply + proposed_mint_amount, admin_address, content, jetton_wallet_code);  ;; Update supply
+}
+
+;; Function to handle the actual minting process
 () mint_tokens(slice to_address, cell jetton_wallet_code, int amount, cell master_msg) impure {
     cell state_init = calculate_jetton_wallet_state_init(to_address, my_address(), jetton_wallet_code);
     slice to_wallet_address = calculate_jetton_wallet_address(state_init);
@@ -43,6 +80,34 @@
             .store_ref(state_init)
             .store_ref(master_msg);
     send_raw_message(msg.end_cell(), 1); ;; pay transfer fees separately, revert on errors
+}
+
+;; Function to propose an admin change (called by multisig)
+() propose_admin_change(slice new_admin_address) impure {
+    throw_unless(73, equal_slices(sender_address, multisig_address));  ;; Only the multisig wallet can propose
+    change_admin_timing = now() + timelock_duration;  ;; Set a timelock
+    proposed_admin = new_admin_address;
+}
+
+;; Function to execute the admin change after the timelock expires
+() execute_admin_change() impure {
+    throw_unless(74, now() >= change_admin_timing);  ;; Ensure the timelock has passed
+    (int total_supply, slice admin_address, cell content, cell jetton_wallet_code) = load_data();
+    save_data(total_supply, proposed_admin, content, jetton_wallet_code);  ;; Change the admin
+}
+
+;; Function to propose a content change (called by multisig)
+() propose_content_change(cell new_content) impure {
+    throw_unless(73, equal_slices(sender_address, multisig_address));  ;; Only the multisig wallet can propose
+    change_content_timing = now() + timelock_duration;  ;; Set a timelock
+    proposed_content = new_content;
+}
+
+;; Function to execute the content change after the timelock expires
+() execute_content_change() impure {
+    throw_unless(74, now() >= change_content_timing);  ;; Ensure the timelock has passed
+    (int total_supply, slice admin_address, cell content, cell jetton_wallet_code) = load_data();
+    save_data(total_supply, admin_address, proposed_content, jetton_wallet_code);  ;; Update content
 }
 
 () recv_internal(int msg_value, cell in_msg_full, slice in_msg_body) impure {
@@ -61,6 +126,7 @@
     cs~skip_bits(1); ;; skip extracurrency collection
     cs~load_coins(); ;; skip ihr_fee
     int fwd_fee = cs~load_coins(); ;; we use message fwd_fee for estimation of provide_wallet_address cost
+    cs.end_parse();
 
     int op = in_msg_body~load_uint(32);
     int query_id = in_msg_body~load_uint(64);
@@ -71,12 +137,8 @@
         throw_unless(73, equal_slices(sender_address, admin_address));
         slice to_address = in_msg_body~load_msg_addr();
         int amount = in_msg_body~load_coins();
-        cell master_msg = in_msg_body~load_ref();
-        slice master_msg_cs = master_msg.begin_parse();
-        master_msg_cs~skip_bits(32 + 64); ;; op + query_id
-        int jetton_amount = master_msg_cs~load_coins();
-        mint_tokens(to_address, jetton_wallet_code, amount, master_msg);
-        save_data(total_supply + jetton_amount, admin_address, content, jetton_wallet_code);
+        propose_mint_tokens(to_address, amount);  ;; Propose the minting
+        in_msg_body.end_parse();
         return ();
     }
 
@@ -88,6 +150,7 @@
         );
         save_data(total_supply - jetton_amount, admin_address, content, jetton_wallet_code);
         slice response_address = in_msg_body~load_msg_addr();
+        in_msg_body.end_parse();
         if (response_address.preload_uint(2) != 0) {
             var msg = begin_cell()
                     .store_uint(0x10, 6) ;; nobounce - int_msg_info$0 ihr_disabled:Bool bounce:Bool bounced:Bool src:MsgAddress -> 011000
@@ -125,6 +188,7 @@
             msg = msg.store_uint(0, 2); ;; addr_none
         }
         send_raw_message(msg.store_maybe_ref(included_address).end_cell(), 64);
+        in_msg_body.end_parse();
         return ();
     }
 
@@ -132,12 +196,14 @@
         throw_unless(73, equal_slices(sender_address, admin_address));
         slice new_admin_address = in_msg_body~load_msg_addr();
         save_data(total_supply, new_admin_address, content, jetton_wallet_code);
+        in_msg_body.end_parse();
         return ();
     }
 
     if (op == 4) { ;; change content, delete this for immutable tokens
         throw_unless(73, equal_slices(sender_address, admin_address));
         save_data(total_supply, admin_address, in_msg_body~load_ref(), jetton_wallet_code);
+        in_msg_body.end_parse();
         return ();
     }
 
